@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/desafio_item.dart';
 import '../models/livro.dart';
 import '../services/data_access_object.dart';
@@ -6,70 +7,130 @@ import 'cadastro_livro.dart';
 import 'detalhes_livro.dart';
 
 class DetalheDesafio extends StatefulWidget {
-  final DesafioItem desafio;
+  final String categoria;
 
-  const DetalheDesafio({super.key, required this.desafio});
+  const DetalheDesafio({super.key, required this.categoria});
 
   @override
   State<DetalheDesafio> createState() => _DetalheDesafioState();
 }
 
 class _DetalheDesafioState extends State<DetalheDesafio> {
+  final _supabase = Supabase.instance.client;
   bool _carregando = true;
+
+  List<DesafioItem> _metas = [];
   List<Livro> _livrosCadastrados = [];
-  // Guarda o vínculo em memória da meta (ex: "São Paulo (SP)" -> Livro)
-  final Map<String, Livro?> _vinculos = {};
+  final Map<String, Livro?> _vinculos = {}; // desafio_id -> Livro
 
   @override
   void initState() {
     super.initState();
-    _carregarLivros();
+    _carregarDados();
   }
 
-  Future<void> _carregarLivros() async {
+  Future<void> _carregarDados() async {
     setState(() => _carregando = true);
-    final livros = await DataAccessObject.obterLivros();
+    try {
+      // 1. Busca os desafios da categoria ordenados por título
+      final List<dynamic> itensData = await _supabase
+          .from('desafio_leitura')
+          .select()
+          .eq('categoria', widget.categoria)
+          .order('titulo', ascending: true);
 
-    if (!mounted) return;
+      final metasCarregadas = itensData.map((e) => DesafioItem.fromMap(e as Map<String, dynamic>)).toList();
 
-    setState(() {
-      _livrosCadastrados = livros;
-      _autovinculaLivrosExistentes();
-      _carregando = false;
-    });
-  }
+      // 2. Busca livros do diário
+      final livros = await DataAccessObject.obterLivros();
 
-  // Busca se algum livro salvo no Supabase cita o nome da meta
-  void _autovinculaLivrosExistentes() {
-    for (var meta in widget.desafio.metas) {
-      if (_vinculos[meta] != null) continue;
+      // 3. Busca progressos já salvos
+      final List<dynamic> progressos = await _supabase
+          .from('progresso_desafio')
+          .select();
 
-      final termoLimpo = meta.split('(').first.trim().toLowerCase();
+      final Map<String, Livro?> mapaRecuperado = {};
 
-      final Livro? correspondente = _livrosCadastrados.cast<Livro?>().firstWhere(
-        (livro) {
-          if (livro == null) return false;
-          final gen = livro.genero.toLowerCase();
-          final des = livro.destaque.toLowerCase();
-          final com = livro.comentario.toLowerCase();
-          final col = livro.nomeColecao.toLowerCase();
+      for (var p in progressos) {
+        final dId = p['desafio_id']?.toString() ?? '';
+        final idLivro = p['id_livro'] != null ? int.tryParse(p['id_livro'].toString()) : null;
+        final titulo = p['titulo_livro']?.toString() ?? '';
 
-          return gen.contains(termoLimpo) ||
-              des.contains(termoLimpo) ||
-              com.contains(termoLimpo) ||
-              col.contains(termoLimpo);
-        },
-        orElse: () => null,
-      );
+        Livro? correspondente;
+        if (idLivro != null) {
+          correspondente = livros.cast<Livro?>().firstWhere(
+            (l) => l?.id == idLivro,
+            orElse: () => null,
+          );
+        }
 
-      if (correspondente != null) {
-        _vinculos[meta] = correspondente;
+        correspondente ??= livros.cast<Livro?>().firstWhere(
+          (l) => l?.titulo.trim().toLowerCase() == titulo.trim().toLowerCase(),
+          orElse: () => null,
+        );
+
+        correspondente ??= Livro(
+          id: idLivro,
+          titulo: titulo,
+          autor: p['autor_livro']?.toString() ?? '',
+          urlCapa: p['capa_url']?.toString() ?? '',
+          sinopse: '',
+          genero: '',
+          nota: 5.0,
+          destaque: '',
+          ehColecao: false,
+          nomeColecao: '',
+          comentario: '',
+        );
+
+        mapaRecuperado[dId] = correspondente;
       }
+
+      if (!mounted) return;
+      setState(() {
+        _metas = metasCarregadas;
+        _livrosCadastrados = livros;
+        _vinculos.clear();
+        _vinculos.addAll(mapaRecuperado);
+        _carregando = false;
+      });
+    } catch (e) {
+      debugPrint("Erro ao carregar dados: $e");
+      if (!mounted) return;
+      setState(() => _carregando = false);
     }
   }
 
-  // Modal para escolher qual livro do banco preenche este desafio
-  void _vincularLivro(String meta) {
+  Future<void> _salvarNoSupabase(String desafioId, Livro livro) async {
+    try {
+      await _supabase.from('progresso_desafio').upsert({
+        'desafio_id': desafioId,
+        'id_livro': livro.id,
+        'titulo_livro': livro.titulo,
+        'autor_livro': livro.autor,
+        'capa_url': livro.urlCapa,
+      }, onConflict: 'desafio_id');
+
+      setState(() {
+        _vinculos[desafioId] = livro;
+      });
+    } catch (e) {
+      debugPrint("Erro ao salvar progresso: $e");
+    }
+  }
+
+  Future<void> _desvincularLivro(String desafioId) async {
+    try {
+      await _supabase.from('progresso_desafio').delete().eq('desafio_id', desafioId);
+      setState(() {
+        _vinculos.remove(desafioId);
+      });
+    } catch (e) {
+      debugPrint("Erro ao remover vínculo: $e");
+    }
+  }
+
+  void _vincularLivro(DesafioItem item) {
     if (_livrosCadastrados.isEmpty) {
       _irParaCadastro();
       return;
@@ -86,7 +147,7 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
               Padding(
                 padding: const EdgeInsets.all(16.0),
                 child: Text(
-                  'Vincular livro a: $meta',
+                  'Vincular livro a: ${item.titulo}',
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
               ),
@@ -108,10 +169,8 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
                       title: Text(livro.titulo, maxLines: 1, overflow: TextOverflow.ellipsis),
                       subtitle: Text(livro.autor, maxLines: 1, overflow: TextOverflow.ellipsis),
                       onTap: () {
-                        setState(() {
-                          _vinculos[meta] = livro;
-                        });
                         Navigator.pop(ctx);
+                        _salvarNoSupabase(item.id, livro);
                       },
                     );
                   },
@@ -141,25 +200,24 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
       MaterialPageRoute(builder: (context) => const CadastroLivro()),
     );
     if (adicionou == true) {
-      _carregarLivros();
+      _carregarDados();
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final metasOrdenadas = List<String>.from(widget.desafio.metas)..sort();
-    final concluidos = metasOrdenadas.where((m) => _vinculos[m] != null).length;
-    final total = metasOrdenadas.length;
+    final concluidos = _metas.where((m) => _vinculos[m.id] != null).length;
+    final total = _metas.length;
     final double progresso = total > 0 ? (concluidos / total) : 0;
 
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.desafio.titulo, style: const TextStyle(fontSize: 16)),
+        title: Text(widget.categoria, style: const TextStyle(fontSize: 16)),
         actions: [
           IconButton(
             icon: const Icon(Icons.add),
-            tooltip: 'Adicionar novo livro',
+            tooltip: 'Cadastrar novo livro no diário',
             onPressed: _irParaCadastro,
           ),
         ],
@@ -168,7 +226,6 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
-                // Barra de progresso do desafio
                 Container(
                   color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.3),
                   padding: const EdgeInsets.all(12),
@@ -189,15 +246,13 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
                   ),
                 ),
                 const Divider(height: 1),
-
-                // Lista alfabética de metas
                 Expanded(
                   child: ListView.builder(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    itemCount: metasOrdenadas.length,
+                    itemCount: _metas.length,
                     itemBuilder: (context, index) {
-                      final meta = metasOrdenadas[index];
-                      final livroVinculado = _vinculos[meta];
+                      final item = _metas[index];
+                      final livroVinculado = _vinculos[item.id];
                       final bool cumprido = livroVinculado != null;
 
                       return Card(
@@ -212,26 +267,35 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
                             size: 22,
                           ),
                           title: Text(
-                            meta,
+                            item.titulo,
                             style: TextStyle(
                               fontWeight: FontWeight.w600,
                               fontSize: 13,
                               decoration: cumprido ? TextDecoration.lineThrough : null,
                             ),
                           ),
-                          subtitle: cumprido
-                              ? Text(
-                                  'Livro: ${livroVinculado.titulo} (${livroVinculado.autor})',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 11, color: Colors.teal),
-                                )
-                              : const Text('Nenhum livro vinculado ainda',
-                                  style: TextStyle(fontSize: 11, color: Colors.grey)),
+                          subtitle: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (item.descricao.isNotEmpty)
+                                Text(item.descricao,
+                                    style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                              if (cumprido)
+                                Text(
+                                  'Lido: ${livroVinculado.titulo} (${livroVinculado.autor})',
+                                  style: const TextStyle(fontSize: 11, color: Colors.teal, fontWeight: FontWeight.bold),
+                                ),
+                            ],
+                          ),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              if (cumprido)
+                              if (cumprido) ...[
+                                IconButton(
+                                  icon: const Icon(Icons.close, size: 18, color: Colors.redAccent),
+                                  tooltip: 'Desvincular livro',
+                                  onPressed: () => _desvincularLivro(item.id),
+                                ),
                                 IconButton(
                                   icon: const Icon(Icons.menu_book, size: 18),
                                   tooltip: 'Ver detalhes do livro',
@@ -244,10 +308,11 @@ class _DetalheDesafioState extends State<DetalheDesafio> {
                                     );
                                   },
                                 ),
+                              ],
                               IconButton(
                                 icon: Icon(cumprido ? Icons.swap_horiz : Icons.link, size: 20),
-                                tooltip: cumprido ? 'Alterar livro' : 'Vincular livro do diário',
-                                onPressed: () => _vincularLivro(meta),
+                                tooltip: cumprido ? 'Trocar livro' : 'Vincular livro do diário',
+                                onPressed: () => _vincularLivro(item),
                               ),
                             ],
                           ),
